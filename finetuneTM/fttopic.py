@@ -1,45 +1,40 @@
-import time,sys
-from neuTopic import models
-import numpy as np,os,pickle,random
-
-from matplotlib import pyplot as plt
-import benchHelp as bHelp
-import torch.optim as optim
-import torch.cuda.amp as tca
-from collections import Counter
-import torch
-import torch.nn as nn
-from neuTopic import dutilsNLP
-from neuTopic import evalTopic
-from neuTopic.evalTopic import cluster_eval
+import sys
+import numpy as np
 import mkl
-import re
 import pysbd #Sentence segmenter https://github.com/nipunsadvilkar/pySBD #pip install pysbd
+import random
+from datasets import Dataset
+from sentence_transformers import (SentenceTransformer,SentenceTransformerTrainer,)
+from sentence_transformers.losses import TripletLoss
+from sentence_transformers.training_args import BatchSamplers
+from sentence_transformers.evaluation import TripletEvaluator
 dtype=np.float32
 np.set_printoptions(threshold=sys.maxsize)
 np.set_printoptions(linewidth=np.inf)
 mkl.set_num_threads(4)
-import multiprocessing
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false" #needed for huggingface transformer, otherwise get warning "The current process just got forked, Disabling parallelism to avoid deadlocks.. To disable this warning, please explicitly set TOKENIZERS_PARALLELISM=(true | false)"
-
-import random
-from datasets import Dataset, IterableDatasetDict
-import numpy as np
-from datasets import load_dataset
-from sentence_transformers import (
-    SentenceTransformer,
-    SentenceTransformerTrainer,
-    SentenceTransformerTrainingArguments,
-    SentenceTransformerModelCardData,
-)
-from sentence_transformers.losses import MultipleNegativesRankingLoss,TripletLoss
-from sentence_transformers.training_args import BatchSamplers
-from sentence_transformers.evaluation import TripletEvaluator
+import multiprocessing
 
 
+def getFineTuningTrainingData(senDocs, model, nneg=2, ftri=0.24, fpos=0.08, fneg=0):
+    """
+    Constructs training data for fine-tuning a language model for topic analysis.
+    This function generates triplets of sentences (anchor, positive, negative) from a list of sentence documents.
+    Positive sentences are close to the anchor in the same document, while negative sentences are randomly chosen
+    from different documents.
 
-def getFineTuningTrainingdata(senDocs, model, nneg=2, ftri=0.24, fpos=0.08, fneg=0):
+    Args:
+    senDocs (list of list of str): List of documents with each document being a list of sentences.
+    model (SentenceTransformer): Pre-trained sentence transformer model to encode sentences.
+    nneg (int, optional): Number of negative samples per positive sample. Defaults to 2.
+    ftri (float, optional): Fraction of triplets to filter based on distance criteria. Defaults to 0.24.
+    fpos (float, optional): Fraction of positive pairs to filter out based on distance. Defaults to 0.08.
+    fneg (float, optional): Fraction of negative pairs to keep if they are close to anchor. Defaults to 0.
+
+    Returns:
+    Dataset: A dataset containing 'anchor', 'positive', and 'negative' sentences for training.
+    """
     num_docs = len(senDocs)
     if num_docs<2:
         print("Need at least two documents but got only",num_docs)
@@ -84,44 +79,49 @@ def getFineTuningTrainingdata(senDocs, model, nneg=2, ftri=0.24, fpos=0.08, fneg
         diff = dist_neg -dist_pos
         threshold = np.percentile(diff, ftri)
         top20 = np.where(diff >= threshold)[0]
-        removed=np.where(diff < threshold)[0]
-        rem=diff[removed]
 
         lanc, lpos, lneg = np.array(lanc)[top20], np.array(lpos)[top20], np.array(lneg)[top20]
         # Remove those with min -!eanc-epos!
         dist_pos = -dist_pos[top20]
         threshold = np.percentile(dist_pos, ftri)
         top20 = np.where(dist_pos >= threshold)[0]
-        removed = np.where(dist_pos < threshold)[0]
-        rem2 = dist_pos[removed]
         lanc, lpos, lneg = np.array(lanc)[top20], np.array(lpos)[top20], np.array(lneg)[top20]
 
         # Remove those with min !eanc-eneg!
         dist_neg = dist_neg[top20]
         threshold = np.percentile(dist_neg,fneg)
         top20 = np.where(dist_neg >= threshold)[0]
-        removed = np.where(dist_neg < threshold)[0]
-        rem3 = dist_neg[removed]
-
-        #l0 = len(lanc)
-        #mima=lambda x:np.round([np.mean(x),np.min(x),np.max(x)],4) if len(x)>0 else ""
+        #removed = np.where(dist_neg < threshold)[0]        #rem3 = dist_neg[removed]        #l0 = len(lanc) #mima=lambda x:np.round([np.mean(x),np.min(x),np.max(x)],4) if len(x)>0 else "" #print("Filtered data for FT",l0,len(lanc),tofilter," Removed diffs",mima(rem)," diffs",mima(diff)," Removed large eanc-epos",mima(rem2)," diffs",mima(dist_pos)," Removed small eanc-eneg",mima(rem3)," diffs",mima(dist_neg),split)
         lanc,lpos,lneg=np.array(lanc)[top20].tolist(),np.array(lpos)[top20].tolist(),np.array(lneg)[top20].tolist()
-        #print("Filtered data for FT",l0,len(lanc),tofilter," Removed diffs",mima(rem)," diffs",mima(diff)," Removed large eanc-epos",mima(rem2)," diffs",mima(dist_pos)," Removed small eanc-eneg",mima(rem3)," diffs",mima(dist_neg),split)
     return Dataset.from_dict({'anchor': lanc, 'positive': lpos, 'negative': lneg})
 
 
-# def getFullData(sentences, nneg=2,tofilter=0,model=None):
-#     return {'train':getAll(sentences,nneg, 'train',tofilter,model),'test':getAll(sentences,nneg, 'test',tofilter,model)}
-
 def split( a, n):
+    """
+    Divides a list into n approximately equal parts.
+
+    Args:
+    a (list): The list to split.
+    n (int): The number of equal parts.
+
+    Returns:
+    generator: A generator yielding each part as a sublist.
+    """
     k, m = divmod(len(a), n)
     return (a[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
 
 def getSentences( docs,nSenPerGroup=3):
     """
-    Segment docs into sentences
-    Input: list of documents, each document being a string
-    Returns: list of documens, each document being a list of sentences
+    Processes a list of documents into a list of sentences grouped by proximity within the document.
+    It uses multiprocessing for faster execution and segments documents into sentences based on the specified
+    number of sentences per group.
+
+    Args:
+    docs (list of str): List of documents, each document being a string.
+    nSenPerGroup (int, optional): Number of sentences per group for segmentation. Defaults to 3.
+
+    Returns:
+    list of list of str: A list of documents where each document is a list of sentence groups.
     """
     print("Segmentation of docs into sentences; Total Docs: ", len(docs))
     # Segment documents into sentences
@@ -153,7 +153,7 @@ def segmenter(docs):
         seg = pysbd.Segmenter(language="en", clean=False)
         adocs=[]
         out=300
-        p0,p1=1,csen #'nSen':(0,1) #combinations of sentences: (x,y) x=0 combine by length, merge i-1 and i if i or i-1 shorter than y tokens; x=1 combine static,i .e., combine y sentences
+        p0,p1=1,csen
         amerges = []
         for id,d in enumerate(docs):
             segs = seg.segment(d)
@@ -169,19 +169,33 @@ def segmenter(docs):
         return adocs,nmerges
 
 
-
-
-#def finetuneTM(documents,margin=0.16,ftri=0.24,fpos=0.08,ep=4):
-ep=1 #It is recommended to use 3 or more, but for a quick run 1 is ok
-    nneg=1 #It is recommended to use 2 (and maybe more), but for a quick run 1 is ok
-    trainingFrac=0.9 #Fraction of documents used to fine-tune model, one might use all for fine-tuning, ie. a value of 1, but to check how well model works <1 is recommended
 def getFTTopic(documents,modelToTune="all-MiniLM-L6-v2",outputName="tunedEncoder",margin=0.16,ftri=0.24,fpos=0.08,nneg=2,ep=4,trainingFrac=1,device = "cuda"):
+    """
+    Fine-tunes a transformer model for topic extraction from a collection of documents.
+    This function configures and initiates the training process based on the provided documents and model,
+    aiming to improve the model's ability to differentiate between the topics of the documents.
+
+    Args:
+    documents (list of str): List of documents to be used for training the model.
+    modelToTune (str, optional): Identifier for the pre-trained model to be fine-tuned. Defaults to "all-MiniLM-L6-v2".
+    outputName (str, optional): The filename to save the fine-tuned model. Defaults to "tunedEncoder".
+    margin (float, optional): Margin for triplet loss during training. Defaults to 0.16.
+    ftri (float, optional): Fraction of triplets to filter based on distance criteria. Defaults to 0.24.
+    fpos (float, optional): Fraction of positive pairs to filter out based on distance. Defaults to 0.08.
+    nneg (int, optional): Number of negative samples per positive sample. Defaults to 2.
+    ep (int, optional): Number of epochs to train the model. Defaults to 4.
+    trainingFrac (float, optional): Fraction of the provided documents to use for training. Defaults to 1.
+    device (str, optional): The device to perform training on (e.g., 'cuda' or 'cpu'). Defaults to "cuda".
+
+    Returns:
+    None: The function saves the fine-tuned model to the specified output file and does not return any value.
+    """
     model = SentenceTransformer(modelToTune, device=device)
     senDocs = getSentences(documents)
     if trainingFrac<1: random.shuffle(senDocs)
     split_index = int(trainingFrac * len(senDocs))  # Calculate split point for 90% train, 10% test
-    trtriplets = getFineTuningTrainingdata(senDocs[:split_index], model, nneg=nneg, ftri=ftri, fpos=fpos, fneg=0)
-    evtriplets = getFineTuningTrainingdata(senDocs[split_index:], model, nneg=nneg, ftri=ftri, fpos=fpos, fneg=0)
+    trtriplets = getFineTuningTrainingData(senDocs[:split_index], model, nneg=nneg, ftri=ftri, fpos=fpos, fneg=0)
+    evtriplets = getFineTuningTrainingData(senDocs[split_index:], model, nneg=nneg, ftri=ftri, fpos=fpos, fneg=0)
 
     from sentence_transformers.training_args import SentenceTransformerTrainingArguments
 
@@ -201,7 +215,6 @@ def getFTTopic(documents,modelToTune="all-MiniLM-L6-v2",outputName="tunedEncoder
         save_steps=1000000,
         save_total_limit=1,
         logging_steps=1000,
-        #run_name="mpnet-base-all-nli-triplet",  # Used in W&B if `wandb` is installed
     )
     if trainingFrac<1:
         dev_evaluator = TripletEvaluator(
@@ -218,7 +231,7 @@ def getFTTopic(documents,modelToTune="all-MiniLM-L6-v2",outputName="tunedEncoder
         train_dataset=trtriplets,
         eval_dataset=evtriplets,
         loss=loss,
-        evaluator=dev_evaluator,
+        evaluator=dev_evaluator if trainingFrac<1 else None,
     )
     trainer.train()
     if trainingFrac < 1: print("Eval after", dev_evaluator(model))
